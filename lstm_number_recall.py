@@ -1,10 +1,11 @@
+'''结果见实验日志2024/3/7 第1条'''
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from simpleai.task.memory.number_recall import NumberRecallDataset
-from simpleai.util.trainer import SimpleTrainer
-from simpleai.data.util import load_model
+from noobai.task.memory.number_recall import NumberRecallDataset
+from noobai.util.trainer import SimpleTrainer
 
 
 class RecallModel(nn.Module):
