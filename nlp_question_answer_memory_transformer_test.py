@@ -1,21 +1,20 @@
+import os
+from typing import Iterable
+
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-
 import numpy as np
 import tiktoken
+from tqdm import tqdm
 
 from noobai.module.nn.resblock import SimpleResWrapper
 from noobai.datasets.nlp.qa import OpenOrcaDataset
 from noobai.util.trainer import SimpleTrainer
 from noobai.module.nn.lr_scheduler import WarmupCosineLRSchedule
 from noobai.module.nn.loss import MaskedCrossEntropyLoss
-
-import torch
-import torch.nn as nn
-from typing import Iterable
-from tqdm import tqdm
-
 from noobai.data.util import save_model
 
 
@@ -37,7 +36,7 @@ class Trainer(SimpleTrainer):
         '''
         if load_model:
             step = self.load_model()
-        
+
         for epoch in range(epochs):
             t_bar = tqdm(
                 total=len(self.dataloader),
@@ -46,16 +45,20 @@ class Trainer(SimpleTrainer):
                 colour="green",
             )
             for ids_tensor, len_tensor, answer_start_idx_tensor in self.dataloader:
-                if self.scheduler is not None:
-                    self.scheduler.step()
+                if (
+                    (len_tensor - answer_start_idx_tensor) == 0
+                ).float().sum().item() > 0:
+                    continue
                 ids_tensor, len_tensor, answer_start_idx_tensor = (
-                    ids_tensor.to(self.device, non_blocking=True),
-                    len_tensor.to(self.device, non_blocking=True),
-                    answer_start_idx_tensor.to(self.device, non_blocking=True),
+                    ids_tensor.to(self.device),
+                    len_tensor.to(self.device),
+                    answer_start_idx_tensor.to(self.device),
                 )
                 ids_tensor = ids_tensor.permute(1, 0)
                 if torch.max(len_tensor - answer_start_idx_tensor).item() == 0:
                     continue
+                if self.scheduler is not None:
+                    self.scheduler.step()
                 self.optimizer.zero_grad()
                 output, loss = self.model(
                     ids_tensor, len_tensor, answer_start_idx_tensor
@@ -87,12 +90,28 @@ class Trainer(SimpleTrainer):
                         scheduler=self.scheduler,
                         model_name=self.model_name,
                     )
-                if (
-                    eval_iter is not None
-                    and self.eval_func is not None
-                    and step % eval_iter == 0
-                ):
-                    self.eval_func()
+                if eval_iter is not None and step % eval_iter == 0:
+                    ids_tensor, len_tensor, answer_start_idx_tensor = (
+                        ids_tensor[:, 0],
+                        len_tensor[0],
+                        answer_start_idx_tensor[0],
+                    )
+                    prerequisite, target, predict = (
+                        ids_tensor[:answer_start_idx_tensor],
+                        ids_tensor[answer_start_idx_tensor:len_tensor],
+                        output[:, 0].argmax(-1),
+                    )
+
+                    def run(x):
+                        text = enc.decode(x.cpu().detach().tolist())
+                        return text
+
+                    with open("test.txt", "w", encoding="utf-8") as f:
+                        f.write(
+                            "条件：{}\n\n\n回复：{}\n\n\n预测：{}".format(
+                                run(prerequisite), run(target), run(predict)
+                            )
+                        )
             t_bar.close()
 
 
@@ -103,6 +122,7 @@ class Model(nn.Module):
         hidden_dim,
         n_layer,
         n_head,
+        eot_token,
         mem_size=32,
         dropout=0,
         forget_rate=0.2,
@@ -111,6 +131,7 @@ class Model(nn.Module):
     ):
         super().__init__()
         self.n_vocab = n_vocab
+        self.eot_token = eot_token
         self.emb = nn.Embedding(n_vocab, hidden_dim)
         self.pos_emb = nn.Embedding(256, hidden_dim)
         self.transformer = nn.TransformerEncoder(
@@ -150,9 +171,10 @@ class Model(nn.Module):
             target[i] = torch.cat(
                 [
                     target[i],
-                    torch.zeros(
+                    torch.ones(
                         t_max_len - target[i].size(0), dtype=torch.long, device=device
-                    ),
+                    )
+                    * self.eot_token,
                 ],
                 dim=0,
             )
@@ -198,17 +220,15 @@ class Model(nn.Module):
         for i in range(0, target.size(0), self.chunk_size):
             chunked_target_list.append(target[i : i + self.chunk_size])
         chunked_target_list = chunked_target_list[:-1]
-        out_list = []
+        result = torch.zeros(t_max_len, batch_size, self.n_vocab, device=device)
         for i, chunked_target in enumerate(chunked_target_list):
             chosen_indices = []
             for j in range(batch_size):
-                if i * self.chunk_size >= len_tensor[j] - answer_start_idx_tensor[j]:
+                if i * self.chunk_size >= target_len_tensor[j]:
                     continue
                 chosen_indices.append(j)
-            tem = torch.zeros(self.chunk_size, batch_size, self.n_vocab, device=device)
             if len(chosen_indices) == 0:
-                out_list.append(tem)
-                continue
+                break
             chunked_target = chunked_target[:, chosen_indices]
             if len(chunked_target.shape) == 2:
                 chunked_target = self.emb(chunked_target)
@@ -224,9 +244,9 @@ class Model(nn.Module):
                 output[: self.mem_size],
                 output[self.mem_size :],
             )
-            tem[:, chosen_indices] = self.l_out(output)
-            out_list.append(tem)
-        result = torch.cat(out_list, dim=0)
+            result[i * self.chunk_size : (i + 1) * self.chunk_size, chosen_indices] = (
+                self.l_out(output)
+            )
         loss = self.loss_func(result, target, mask=target_len_tensor)
         return result, loss
 
@@ -238,17 +258,19 @@ if __name__ == '__main__':
         enc,
         cache_dir="D:/AI/HuggingFace/datasets",
         is_val=True,
-        max_len=512,
-        val_rate=0.0005,
+        max_len=1024,
+        val_rate=0.005,
     )
     dataloader = DataLoader(
         dataset,
-        batch_size=2,
+        batch_size=8,
         shuffle=True,
         drop_last=True,
         collate_fn=dataset.collate_fn,
     )
-    model = Model(enc.n_vocab, 768, 3, 8).to(device)
+    model = Model(
+        enc.n_vocab, 1024, 3, 8, enc.eot_token, forget_rate=0.3, loop_time=5
+    ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-5)
     scheduler = WarmupCosineLRSchedule(
         optimizer,
@@ -266,4 +288,4 @@ if __name__ == '__main__':
         scheduler=scheduler,
         model_name="nlp_qa_mem_transformer",
     )
-    trainer.train()
+    trainer.train(eval_iter=100)
